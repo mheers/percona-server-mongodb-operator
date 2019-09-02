@@ -49,6 +49,7 @@ type PerconaServerMongoDBSpec struct {
 	RunUID           int64                                `json:"runUid,omitempty"`
 	UnsafeConf       bool                                 `json:"allowUnsafeConfigurations"`
 	Maintenance      bool                                 `json:"maintenance"`
+	InitDatabase     string                               `json:"initDatabase,omitempty"`
 	Mongod           *MongodSpec                          `json:"mongod,omitempty"`
 	Replsets         []*ReplsetSpec                       `json:"replsets,omitempty"`
 	Secrets          *SecretsSpec                         `json:"secrets,omitempty"`

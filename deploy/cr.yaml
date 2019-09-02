@@ -11,6 +11,7 @@ spec:
 #  runUid: 1001
   allowUnsafeConfigurations: false
   maintenance: false
+  initDatabase: db
 #  updateStrategy: RollingUpdate
   secrets:
     users: my-cluster-name-secrets

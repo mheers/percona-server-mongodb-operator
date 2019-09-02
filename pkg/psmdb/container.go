@@ -130,6 +130,10 @@ func container(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec, name strin
 				Value: strconv.FormatBool(m.Spec.Maintenance),
 			},
 			{
+				Name:  "MONGODB_INITDB",
+				Value: m.Spec.InitDatabase,
+			},
+			{
 				Name:  "DEFAULT_ARGS",
 				Value: strings.Join(argsDefault[:], " "),
 			},
