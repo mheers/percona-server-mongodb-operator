@@ -52,18 +52,53 @@ func container(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec, name strin
 		)
 	}
 
+	command := []string{}
+	args := containerArgs(m, replset, resources)
+	readinessProbe := &corev1.Probe{
+		Handler: corev1.Handler{
+			TCPSocket: &corev1.TCPSocketAction{
+				Port: intstr.FromInt(int(m.Spec.Mongod.Net.Port)),
+			},
+		},
+		InitialDelaySeconds: *replset.ReadinessInitialDelaySeconds,
+		TimeoutSeconds:      int32(2),
+		PeriodSeconds:       int32(3),
+		FailureThreshold:    int32(8),
+	}
+	livenessProbe := &corev1.Probe{
+		Handler: corev1.Handler{
+			Exec: &corev1.ExecAction{
+				Command: []string{
+					"mongodb-healthcheck",
+					"k8s",
+					"liveness",
+				},
+			},
+		},
+		InitialDelaySeconds: *replset.LivenessInitialDelaySeconds,
+		TimeoutSeconds:      int32(5),
+		PeriodSeconds:       int32(10),
+		FailureThreshold:    int32(12),
+	}
+
+	// on maintenance we do not want any liveness- or readyness-probes but want the server not start automatically
+	if m.Spec.Maintenance {
+		command = []string{
+			"sleep",
+		}
+		args = []string{
+			"infinity",
+		}
+		readinessProbe = nil
+		livenessProbe = nil
+	}
+
 	return corev1.Container{
 		Name:            name,
 		Image:           m.Spec.Image,
 		ImagePullPolicy: m.Spec.ImagePullPolicy,
-		//// comment in for debugging:
-		// Command:  []string{
-		// 	"sleep",
-		// },
-		// Args: [] string {
-		// 	"infinity",
-		// },
-		Args:            containerArgs(m, replset, resources),
+		Command:         command,
+		Args:            args,
 		Ports: []corev1.ContainerPort{
 			{
 				Name:          mongodPortName,
@@ -99,34 +134,10 @@ func container(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec, name strin
 				},
 			},
 		},
-		WorkingDir: MongodContainerDataDir,
-		LivenessProbe: &corev1.Probe{
-			Handler: corev1.Handler{
-				Exec: &corev1.ExecAction{
-					Command: []string{
-						"mongodb-healthcheck",
-						"k8s",
-						"liveness",
-					},
-				},
-			},
-			InitialDelaySeconds: *replset.LivenessInitialDelaySeconds,
-			TimeoutSeconds:      int32(5),
-			PeriodSeconds:       int32(10),
-			FailureThreshold:    int32(12),
-		},
-		ReadinessProbe: &corev1.Probe{
-			Handler: corev1.Handler{
-				TCPSocket: &corev1.TCPSocketAction{
-					Port: intstr.FromInt(int(m.Spec.Mongod.Net.Port)),
-				},
-			},
-			InitialDelaySeconds: *replset.ReadinessInitialDelaySeconds,
-			TimeoutSeconds:      int32(2),
-			PeriodSeconds:       int32(3),
-			FailureThreshold:    int32(8),
-		},
-		Resources: resources,
+		WorkingDir:     MongodContainerDataDir,
+		LivenessProbe:  livenessProbe,
+		ReadinessProbe: readinessProbe,
+		Resources:      resources,
 		SecurityContext: &corev1.SecurityContext{
 			RunAsNonRoot: &fvar,
 			RunAsUser:    runUID,

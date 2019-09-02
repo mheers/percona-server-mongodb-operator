@@ -10,6 +10,7 @@ spec:
 #    - name: private-registry-credentials
 #  runUid: 1001
   allowUnsafeConfigurations: false
+  maintenance: false
 #  updateStrategy: RollingUpdate
   secrets:
     users: my-cluster-name-secrets

@@ -48,6 +48,7 @@ type PerconaServerMongoDBSpec struct {
 	ImagePullSecrets []corev1.LocalObjectReference        `json:"imagePullSecrets,omitempty"`
 	RunUID           int64                                `json:"runUid,omitempty"`
 	UnsafeConf       bool                                 `json:"allowUnsafeConfigurations"`
+	Maintenance      bool                                 `json:"maintenance"`
 	Mongod           *MongodSpec                          `json:"mongod,omitempty"`
 	Replsets         []*ReplsetSpec                       `json:"replsets,omitempty"`
 	Secrets          *SecretsSpec                         `json:"secrets,omitempty"`
@@ -156,7 +157,6 @@ type ReplsetSpec struct {
 }
 
 type VolumeSpec struct {
-
 	MongodDataVolClaimName string `json:"mongodDataVolClaimName"`
 
 	// EmptyDir represents a temporary directory that shares a pod's lifetime.
