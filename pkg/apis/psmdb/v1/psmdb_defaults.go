@@ -147,8 +147,13 @@ func (cr *PerconaServerMongoDB) CheckNSetDefaults(platform version.Platform, log
 		cr.Spec.RunUID = defaultRunUID
 	}
 
-	// there is shouldn't be any backups while pause
+	// there shouldn't be any backups while pause
 	if cr.Spec.Pause {
+		cr.Spec.Backup.Enabled = false
+	}
+
+	// there shouldn't be any backups while maintenance
+	if cr.Spec.Maintenance {
 		cr.Spec.Backup.Enabled = false
 	}
 
