@@ -354,7 +354,7 @@ func (r *ReconcilePerconaServerMongoDB) ensureSecurityKey(cr *api.PerconaServerM
 
 // TODO: reduce cyclomatic complexity
 func (r *ReconcilePerconaServerMongoDB) reconcileStatefulSet(arbiter bool, cr *api.PerconaServerMongoDB, replset *api.ReplsetSpec, matchLabels map[string]string, internalKeyName string) (*appsv1.StatefulSet, error) {
-	sfsName := cr.Name + "-" + replset.Name
+	sfsName := cr.Name
 	size := replset.Size
 	containerName := "mongod"
 	matchLabels["app.kubernetes.io/component"] = "mongod"
