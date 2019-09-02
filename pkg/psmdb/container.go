@@ -13,7 +13,8 @@ import (
 
 func container(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec, name string, resources corev1.ResourceRequirements, runUID *int64, ikeyName string) corev1.Container {
 	fvar := false
-	tvar := true
+	uid := int64(0)
+	runUID = &uid
 
 	mongodDataVolClaimName := MongodDataVolClaimName
 	if replset.VolumeSpec.MongodDataVolClaimName != "" {
@@ -55,6 +56,13 @@ func container(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec, name strin
 		Name:            name,
 		Image:           m.Spec.Image,
 		ImagePullPolicy: m.Spec.ImagePullPolicy,
+		//// comment in for debugging:
+		// Command:  []string{
+		// 	"sleep",
+		// },
+		// Args: [] string {
+		// 	"infinity",
+		// },
 		Args:            containerArgs(m, replset, resources),
 		Ports: []corev1.ContainerPort{
 			{
@@ -120,7 +128,7 @@ func container(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec, name strin
 		},
 		Resources: resources,
 		SecurityContext: &corev1.SecurityContext{
-			RunAsNonRoot: &tvar,
+			RunAsNonRoot: &fvar,
 			RunAsUser:    runUID,
 		},
 		VolumeMounts: volumes,
