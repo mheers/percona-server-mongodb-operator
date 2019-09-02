@@ -49,8 +49,8 @@ func PMMContainer(spec api.PMMSpec, secrets string, customLogin bool) corev1.Con
 				},
 			},
 			{
-				Name:  "DB_ARGS",
-				Value: "--uri=mongodb://$(MONGODB_USER):$(MONGODB_PASSWORD)@127.0.0.1:27017/",
+				Name:  "MONGODB_URI",
+				Value: "mongodb://$(MONGODB_USER):$(MONGODB_PASSWORD)@127.0.0.1:27017/",
 			},
 		},
 	}

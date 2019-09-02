@@ -14,8 +14,8 @@ spec:
   secrets:
     users: my-cluster-name-secrets
   pmm:
-    enabled: false
-    image: perconalab/pmm-client:1.17.1
+    enabled: true
+    image: forekshub/percona-mongodb-exporter
     serverHost: monitoring-service
   replsets:
   - name: rs0
