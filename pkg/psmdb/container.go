@@ -15,9 +15,13 @@ func container(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec, name strin
 	fvar := false
 	tvar := true
 
+	mongodDataVolClaimName := MongodDataVolClaimName
+	if replset.VolumeSpec.MongodDataVolClaimName != "" {
+		mongodDataVolClaimName = replset.VolumeSpec.MongodDataVolClaimName
+	}
 	volumes := []corev1.VolumeMount{
 		{
-			Name:      MongodDataVolClaimName,
+			Name:      mongodDataVolClaimName,
 			MountPath: MongodContainerDataDir,
 		},
 		{

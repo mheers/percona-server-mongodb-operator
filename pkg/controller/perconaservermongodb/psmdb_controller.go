@@ -385,6 +385,12 @@ func (r *ReconcilePerconaServerMongoDB) reconcileStatefulSet(arbiter bool, cr *a
 		return nil, fmt.Errorf("create StatefulSet.Spec %s: %v", sfs.Name, err)
 	}
 
+	mongodDataVolClaimName := psmdb.MongodDataVolClaimName
+	if replset.VolumeSpec.MongodDataVolClaimName != "" {
+		mongodDataVolClaimName = replset.VolumeSpec.MongodDataVolClaimName
+	}
+
+
 	// add TLS/SSL Volume
 	t := true
 	sfsSpec.Template.Spec.Volumes = append(sfsSpec.Template.Spec.Volumes,
@@ -413,7 +419,7 @@ func (r *ReconcilePerconaServerMongoDB) reconcileStatefulSet(arbiter bool, cr *a
 	if arbiter {
 		sfsSpec.Template.Spec.Volumes = append(sfsSpec.Template.Spec.Volumes,
 			corev1.Volume{
-				Name: psmdb.MongodDataVolClaimName,
+				Name: mongodDataVolClaimName,
 				VolumeSource: corev1.VolumeSource{
 					EmptyDir: &corev1.EmptyDirVolumeSource{},
 				},
@@ -422,12 +428,12 @@ func (r *ReconcilePerconaServerMongoDB) reconcileStatefulSet(arbiter bool, cr *a
 	} else {
 		if replset.VolumeSpec.PersistentVolumeClaim != nil {
 			sfsSpec.VolumeClaimTemplates = []corev1.PersistentVolumeClaim{
-				psmdb.PersistentVolumeClaim(psmdb.MongodDataVolClaimName, cr.Namespace, replset.VolumeSpec.PersistentVolumeClaim),
+				psmdb.PersistentVolumeClaim(mongodDataVolClaimName, cr.Namespace, replset.VolumeSpec.PersistentVolumeClaim),
 			}
 		} else {
 			sfsSpec.Template.Spec.Volumes = append(sfsSpec.Template.Spec.Volumes,
 				corev1.Volume{
-					Name: psmdb.MongodDataVolClaimName,
+					Name: mongodDataVolClaimName,
 					VolumeSource: corev1.VolumeSource{
 						HostPath: replset.VolumeSpec.HostPath,
 						EmptyDir: replset.VolumeSpec.EmptyDir,

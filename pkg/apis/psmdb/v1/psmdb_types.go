@@ -156,6 +156,9 @@ type ReplsetSpec struct {
 }
 
 type VolumeSpec struct {
+
+	MongodDataVolClaimName string `json:"mongodDataVolClaimName"`
+
 	// EmptyDir represents a temporary directory that shares a pod's lifetime.
 	EmptyDir *corev1.EmptyDirVolumeSource `json:"emptyDir,omitempty"`
 
