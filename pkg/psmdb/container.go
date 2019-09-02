@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
@@ -53,7 +54,8 @@ func container(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec, name strin
 	}
 
 	command := []string{}
-	args := containerArgs(m, replset, resources)
+	argsDefault := containerArgs(m, replset, resources)
+	args := argsDefault
 	readinessProbe := &corev1.Probe{
 		Handler: corev1.Handler{
 			TCPSocket: &corev1.TCPSocketAction{
@@ -122,6 +124,14 @@ func container(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec, name strin
 			{
 				Name:  "MONGODB_REPLSET",
 				Value: replset.Name,
+			},
+			{
+				Name:  "MAINTENANCE",
+				Value: strconv.FormatBool(m.Spec.Maintenance),
+			},
+			{
+				Name:  "DEFAULT_ARGS",
+				Value: strings.Join(argsDefault[:], " "),
 			},
 		},
 		EnvFrom: []corev1.EnvFromSource{
