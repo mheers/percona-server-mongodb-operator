@@ -1,6 +1,7 @@
 package psmdb
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"strconv"
@@ -95,6 +96,8 @@ func container(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec, name strin
 		livenessProbe = nil
 	}
 
+	initDatabases, _ := json.MarshalIndent(m.Spec.InitDatabases, "", "\t")
+
 	return corev1.Container{
 		Name:            name,
 		Image:           m.Spec.Image,
@@ -130,8 +133,8 @@ func container(m *api.PerconaServerMongoDB, replset *api.ReplsetSpec, name strin
 				Value: strconv.FormatBool(m.Spec.Maintenance),
 			},
 			{
-				Name:  "MONGODB_INITDB",
-				Value: m.Spec.InitDatabase,
+				Name:  "MONGODB_INITDBS",
+				Value: string(initDatabases),
 			},
 			{
 				Name:  "DEFAULT_ARGS",

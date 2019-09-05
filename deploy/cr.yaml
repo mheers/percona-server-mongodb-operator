@@ -4,14 +4,21 @@ metadata:
   name: my-cluster-name
 spec:
 #  platform: openshift
-  image: percona/percona-server-mongodb-operator:1.1.0-mongod4.0
+  # image: percona/percona-server-mongodb-operator:1.1.0-mongod4.0
+  image: mheers/percona-server-mongodb-operator:1.1.0-mongod4.0 #for testing
   imagePullPolicy: Always
 #  imagePullSecrets:
 #    - name: private-registry-credentials
 #  runUid: 1001
-  allowUnsafeConfigurations: false
+  allowUnsafeConfigurations: true
   maintenance: false
-  initDatabase: db
+  initDatabases:
+    - name: test1
+      username: myuser1
+      password: mypassword1
+    - name: test2
+      username: myuser2
+      password: mypassword2
 #  updateStrategy: RollingUpdate
   secrets:
     users: my-cluster-name-secrets
@@ -21,7 +28,7 @@ spec:
     serverHost: monitoring-service
   replsets:
   - name: rs0
-    size: 3
+    size: 1
     affinity:
       antiAffinityTopologyKey: "kubernetes.io/hostname"
 #      advanced:

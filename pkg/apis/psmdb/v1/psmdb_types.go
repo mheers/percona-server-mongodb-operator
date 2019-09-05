@@ -49,7 +49,7 @@ type PerconaServerMongoDBSpec struct {
 	RunUID           int64                                `json:"runUid,omitempty"`
 	UnsafeConf       bool                                 `json:"allowUnsafeConfigurations"`
 	Maintenance      bool                                 `json:"maintenance"`
-	InitDatabase     string                               `json:"initDatabase,omitempty"`
+	InitDatabases    []InitDatabase                       `json:"initDatabases,omitempty"`
 	Mongod           *MongodSpec                          `json:"mongod,omitempty"`
 	Replsets         []*ReplsetSpec                       `json:"replsets,omitempty"`
 	Secrets          *SecretsSpec                         `json:"secrets,omitempty"`
@@ -57,6 +57,12 @@ type PerconaServerMongoDBSpec struct {
 	ImagePullPolicy  corev1.PullPolicy                    `json:"imagePullPolicy,omitempty"`
 	PMM              PMMSpec                              `json:"pmm,omitempty"`
 	UpdateStrategy   appsv1.StatefulSetUpdateStrategyType `json:"updateStrategy,omitempty"`
+}
+
+type InitDatabase struct {
+	Name     string `json:"name,omitempty"`
+	Username string `json:"username,omitempty"`
+	Password string `json:"password,omitempty"`
 }
 
 type ReplsetMemberStatus struct {
