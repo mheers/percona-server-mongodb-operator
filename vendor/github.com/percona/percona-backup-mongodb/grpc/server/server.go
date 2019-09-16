@@ -12,9 +12,11 @@ import (
 	"time"
 
 	"github.com/hashicorp/go-multierror"
+	"github.com/olebedev/emitter"
 	"github.com/percona/percona-backup-mongodb/internal/notify"
 	pb "github.com/percona/percona-backup-mongodb/proto/messages"
 	"github.com/pkg/errors"
+	"github.com/prometheus/common/log"
 	"github.com/sirupsen/logrus"
 )
 
@@ -22,19 +24,32 @@ const (
 	EventBackupFinish = iota
 	EventOplogFinish
 	EventRestoreFinish
-	EventBackupStarted
+
+	// If this list is updated, please also update the isValidEvent and eventName functions
+	BackupFinishedEvent      = 0
+	BackupStartedEvent       = 1
+	BeforeBalancerStartEvent = 2
+	AfterBalancerStartEvent  = 3
+	BeforeBalancerStopEvent  = 4
+	AfterBalancerStopEvent   = 5
+
+	WaitForever = -1
 
 	logBufferSize = 500
 )
 
 type backupStatus struct {
+	// the balancer status before starting a backup/restore.
+	// After backup/restore has been completed, we must return the balancer status to its original state
+	balancerStatus     *pb.BalancerStatus
 	lastBackupMetadata *BackupMetadata
-	lastOplogTs        int64 // Timestamp in Unix format
+	//	lastOplogTs        int64 // Timestamp in Unix format
 	// The name lastBackupErrors is plural because we are concatenating errors using the multierror pkg
 	lastBackupErrors      error
 	replicasRunningBackup map[string]bool // Key is ReplicasetUUID
 	backupRunning         bool
 	oplogBackupRunning    bool
+	sources               map[string]*Client // clients that ran the last backup
 }
 
 type MessagesServer struct {
@@ -45,19 +60,20 @@ type MessagesServer struct {
 
 	backupStatusLock *sync.Mutex
 	backupStatus     backupStatus
-	lock             *sync.Mutex
-	clients          map[string]*Client
+
+	clientsLock *sync.Mutex
+	clients     map[string]*Client
 
 	logger *logrus.Logger
+
+	eventsNotifier *emitter.Emitter
 
 	clientDisconnetedChan chan string
 	stopChan              chan struct{}
 
 	// Events notification channels
-	dbBackupFinishChan    chan interface{}
 	oplogBackupFinishChan chan interface{}
 	restoreFinishChan     chan interface{}
-	backupStartedChan     chan interface{}
 
 	clientsLogChan chan *pb.LogEntry
 }
@@ -97,17 +113,18 @@ func newMessagesServer(workDir string, logger *logrus.Logger) *MessagesServer {
 	}
 
 	messagesServer := &MessagesServer{
-		lock:                  &sync.Mutex{},
-		backupStatusLock:      &sync.Mutex{},
+		clientsLock:      &sync.Mutex{},
+		backupStatusLock: &sync.Mutex{},
+
 		clients:               make(map[string]*Client),
 		clientDisconnetedChan: make(chan string),
 		stopChan:              make(chan struct{}),
 		clientsLogChan:        make(chan *pb.LogEntry, logBufferSize),
 		//
-		dbBackupFinishChan:    notify.Start(EventBackupFinish),
 		oplogBackupFinishChan: notify.Start(EventOplogFinish),
 		restoreFinishChan:     notify.Start(EventRestoreFinish),
-		backupStartedChan:     notify.Start(EventBackupStarted),
+
+		eventsNotifier: &emitter.Emitter{},
 
 		replicasRunningBackup: make(map[string]bool), // Key is ReplicasetUUID
 		backupStatus: backupStatus{
@@ -122,8 +139,9 @@ func newMessagesServer(workDir string, logger *logrus.Logger) *MessagesServer {
 }
 
 func (s *MessagesServer) BackupSourceNameByReplicaset() (map[string]string, error) {
-	s.lock.Lock()
-	defer s.lock.Unlock()
+	s.clientsLock.Lock()
+	defer s.clientsLock.Unlock()
+
 	sources := make(map[string]string)
 	for _, client := range s.clients {
 		if _, ok := sources[client.ReplicasetName]; !ok {
@@ -140,38 +158,76 @@ func (s *MessagesServer) BackupSourceNameByReplicaset() (map[string]string, erro
 	return sources, nil
 }
 
+func (s *MessagesServer) getRestoreSrcResponses(sources map[string]RestoreSource,
+	ch chan pb.CanRestoreBackupResponse, wga *sync.WaitGroup) {
+	for resp := range ch {
+		_, ok := sources[resp.Replicaset]
+		if !ok {
+			sources[resp.Replicaset] = RestoreSource{}
+		}
+		if resp.IsPrimary {
+			source := sources[resp.Replicaset]
+			source.Host = resp.Host
+			source.Port = resp.Port
+			sources[resp.Replicaset] = source
+		}
+		if resp.CanRestore {
+			source := sources[resp.Replicaset]
+			source.Client = s.getClientByID(resp.ClientId)
+			sources[resp.Replicaset] = source
+		}
+	}
+	wga.Done()
+}
+
+/* here we have list of clients by replicaset. The list can be:
+      [rs1] -> .Client = nil
+	  [rs2] -> .Client = pointer to the restore client
+
+	  we need to check that we have sources from all replicasets and all sources have a valid client (! nil)
+*/
+func validateRestoreSources(sources map[string]RestoreSource, rsets map[string]*pb.ReplicasetMetadata,
+	storageName string) error {
+	var err error
+	if len(sources) != len(rsets) {
+		for replicasetName, replicasetMetaData := range rsets {
+			if _, ok := sources[replicasetName]; !ok {
+				err = multierror.Append(err,
+					fmt.Errorf("there are no clients connected to replicaset %s that can restore %s from %s",
+						replicasetName,
+						replicasetMetaData.DbBackupName,
+						storageName,
+					),
+				)
+			}
+		}
+	}
+
+	for replicasetName, source := range sources {
+		if source.Client == nil {
+			err = multierror.Append(err,
+				fmt.Errorf("there are no clients connected to replicaset %s",
+					replicasetName,
+				),
+			)
+		}
+	}
+
+	return err
+}
+
 func (s *MessagesServer) RestoreSourcesByReplicaset(bm *pb.BackupMetadata, storageName string) (
 	map[string]RestoreSource, error) {
-	s.lock.Lock()
-	defer s.lock.Unlock()
-
 	sources := make(map[string]RestoreSource)
 	wga := &sync.WaitGroup{}
 	wgb := &sync.WaitGroup{}
 	ch := make(chan pb.CanRestoreBackupResponse)
 
 	wga.Add(1)
-	go func() {
-		for resp := range ch {
-			if !resp.CanRestore {
-				continue
-			}
-			_, ok := sources[resp.Replicaset]
-			if !ok {
-				sources[resp.Replicaset] = RestoreSource{
-					Client: s.getClientByID(resp.ClientId),
-				}
-			}
-			if resp.IsPrimary {
-				s := sources[resp.Replicaset]
-				s.Host = resp.Host
-				s.Port = resp.Port
-				sources[resp.Replicaset] = s
-			}
-		}
-		wga.Done()
-	}()
 
+	go s.getRestoreSrcResponses(sources, ch, wga)
+
+	s.clientsLock.Lock()
 	for replicasetName, replicasetMetaData := range bm.Replicasets {
 		for _, client := range s.clients {
 			if client.NodeType == pb.NodeType_NODE_TYPE_MONGOS {
@@ -197,32 +253,24 @@ func (s *MessagesServer) RestoreSourcesByReplicaset(bm *pb.BackupMetadata, stora
 			}()
 		}
 	}
+	s.clientsLock.Unlock()
+
 	wgb.Wait()
 	close(ch)
 	wga.Wait()
 
-	if len(sources) != len(bm.Replicasets) {
-		var err error
-		for replicasetName, replicasetMetaData := range bm.Replicasets {
-			if _, ok := sources[replicasetName]; !ok {
-				err = multierror.Append(err,
-					fmt.Errorf("there are no clients connected to replicaset %s that can restore %s from %s",
-						replicasetName,
-						replicasetMetaData.DbBackupName,
-						storageName,
-					),
-				)
-			}
-		}
+	if err := validateRestoreSources(sources, bm.Replicasets, bm.StorageName); err != nil {
 		return nil, err
 	}
 	return sources, nil
 }
 
 func (s *MessagesServer) BackupSourceByReplicaset() (map[string]*Client, error) {
-	s.lock.Lock()
-	defer s.lock.Unlock()
 	sources := make(map[string]*Client)
+
+	s.clientsLock.Lock()
+	defer s.clientsLock.Unlock()
+
 	for _, client := range s.clients {
 		if _, ok := sources[client.ReplicasetName]; !ok {
 			if client.NodeType == pb.NodeType_NODE_TYPE_MONGOS {
@@ -231,24 +279,23 @@ func (s *MessagesServer) BackupSourceByReplicaset() (map[string]*Client, error) 
 			backupSource, err := client.GetBackupSource()
 			if err != nil {
 				s.logger.Errorf("Cannot get backup source for client %s: %s", client.NodeName, err)
-			}
-			if err != nil {
-				return nil, fmt.Errorf("cannot get best client for replicaset %q: %s", client.ReplicasetName, err)
+				continue
 			}
 			bestClient := s.getClientByNodeName(backupSource)
-			if bestClient == nil {
-				return nil, fmt.Errorf("cannot get the client connected to MongoDB %s", backupSource)
+			if bestClient != nil {
+				sources[client.ReplicasetName] = bestClient
 			}
-			sources[client.ReplicasetName] = bestClient
 		}
 	}
-
+	if len(sources) == 0 {
+		return nil, fmt.Errorf("cannot get best client")
+	}
 	return sources, nil
 }
 
 func (s *MessagesServer) Clients() map[string]Client {
-	s.lock.Lock()
-	defer s.lock.Unlock()
+	s.clientsLock.Lock()
+	defer s.clientsLock.Unlock()
 
 	c := make(map[string]Client)
 	for id, client := range s.clients {
@@ -269,19 +316,15 @@ func (s *MessagesServer) ClientsByReplicaset() map[string][]Client {
 		replicas[client.ReplicasetName] = append(replicas[client.ReplicasetName], *client)
 
 	}
+
 	return replicas
 }
 
 func (s *MessagesServer) LastOplogTs() int64 {
-	s.lock.Lock()
-	defer s.lock.Unlock()
-	return s.backupStatus.lastOplogTs
+	return s.backupStatus.lastBackupMetadata.LastOplogTs()
 }
 
 func (s *MessagesServer) ListStorages() (map[string]StorageEntry, error) {
-	s.lock.Lock()
-	defer s.lock.Unlock()
-
 	return s.listStorages()
 }
 
@@ -290,42 +333,17 @@ func (s *MessagesServer) listStorages() (map[string]StorageEntry, error) {
 	// Get all storages from all clients.
 	// At the end of this loop, stgs is a map where the key is the client id and the value is an
 	// array of all storages that client has defined.
-	type resp struct {
-		id     string
-		ssInfo []*pb.StorageInfo
-	}
 	var errs error
-	//lock := sync.Mutex{}
-
-	wga := &sync.WaitGroup{}
-	wgb := sync.WaitGroup{}
-	ch := make(chan resp)
-
-	wga.Add(1)
-	go func() {
-		for r := range ch {
-			stgs[r.id] = r.ssInfo
-		}
-		wga.Done()
-	}()
 
 	for lid, lc := range s.clients {
 		id := lid
 		c := lc
-		wgb.Add(1)
-		go func() {
-			defer wgb.Done()
-			ssInfo, err := c.GetStoragesInfo()
-			if err != nil {
-				errs = multierror.Append(errs, err)
-				return
-			}
-			ch <- resp{id: id, ssInfo: ssInfo}
-		}()
+		ssInfo, err := c.GetStoragesInfo()
+		if err != nil {
+			errs = multierror.Append(errs, err)
+		}
+		stgs[id] = ssInfo
 	}
-	wgb.Wait()
-	close(ch)
-	wga.Wait()
 
 	if errs != nil {
 		return nil, errs
@@ -334,7 +352,7 @@ func (s *MessagesServer) listStorages() (map[string]StorageEntry, error) {
 	// Group storages by name and build two lists:
 	// 1. Clients where the storages definitions matches
 	// 2. Clients where the storages definitions are different
-	// The lists are sorted only to make it easier to test
+	// The list is sorted only to make it easier to test
 	ss := make(map[string]StorageEntry)
 	for clientID, storages := range stgs {
 		for _, info := range storages {
@@ -361,8 +379,9 @@ func (s *MessagesServer) listStorages() (map[string]StorageEntry, error) {
 }
 
 func (s *MessagesServer) RefreshClients() error {
-	s.lock.Lock()
-	defer s.lock.Unlock()
+	s.clientsLock.Lock()
+	defer s.clientsLock.Unlock()
+
 	for _, client := range s.clients {
 		if err := client.ping(); err != nil {
 			return errors.Wrapf(err, "cannot refresh clients list while pinging client %s (%s)", client.ID, client.NodeName)
@@ -376,8 +395,7 @@ func (s *MessagesServer) RefreshClients() error {
 // - Mongos
 // - Config Server
 // - Shard Server
-// or if the ClusterID is not empty because in a sharded system, the cluster id
-// is never empty.
+// or if the ClusterID is not empty because in a sharded system, the cluster id is never empty.
 func (s *MessagesServer) IsShardedSystem() bool {
 	for _, client := range s.clients {
 		if client.NodeType == pb.NodeType_NODE_TYPE_MONGOS ||
@@ -390,9 +408,9 @@ func (s *MessagesServer) IsShardedSystem() bool {
 	return false
 }
 
-// func (s *MessagesServer) LastBackupErrors() error {
-// 	return s.backupStatus.lastBackupErrors
-// }
+func (s *MessagesServer) LastBackupErrors() error {
+	return s.backupStatus.lastBackupErrors
+}
 
 func (s *MessagesServer) LastBackupMetadata() *BackupMetadata {
 	return s.backupStatus.lastBackupMetadata
@@ -405,6 +423,12 @@ func (s *MessagesServer) ListBackups() (map[string]pb.BackupMetadata, error) {
 	}
 
 	backups := make(map[string]pb.BackupMetadata)
+
+	// mongoDBVersion, err := s.getMongoDBVersion()
+	// if err != nil {
+	// 	s.logger.Info("get db version: " + err.Error())
+	// }
+
 	for _, file := range files {
 		if !strings.HasSuffix(file.Name(), ".json") {
 			continue
@@ -414,20 +438,57 @@ func (s *MessagesServer) ListBackups() (map[string]pb.BackupMetadata, error) {
 		if err != nil {
 			return nil, fmt.Errorf("invalid backup metadata file %s: %s", filename, err)
 		}
-		backups[file.Name()] = *bm.Metadata()
-	}
 
+		backups[file.Name()] = *bm.Metadata()
+
+		// TODO: Why do we need the for the K8s operator?
+		// for replName, source := range s.clients {
+		// 	s.logger.Info("Range replicasets for replset " + replName + "and s.replsname: " + source.ReplicasetName)
+		// 	for bmReplName, metadata := range backups[file.Name()].Replicasets {
+		// 		s.logger.Info("bmRepName:" + bmReplName + ", meta:" + metadata.ClusterId)
+		// 		if bmReplName == source.ReplicasetName {
+		// 			msg := &pb.RestoreBackupCheck{
+		// 				BackupType:        backups[file.Name()].BackupType,
+		// 				DbSourceName:      metadata.DbBackupName,
+		// 				OplogSourceName:   metadata.OplogBackupName,
+		// 				CompressionType:   backups[file.Name()].CompressionType,
+		// 				Cypher:            backups[file.Name()].Cypher,
+		// 				SkipUsersAndRoles: false,
+		// 				Host:              "",
+		// 				Port:              "",
+		// 				StorageName:       backups[file.Name()].StorageName,
+		// 				MongodbVersion:    mongoDBVersion,
+		// 			}
+		// 			s.logger.Info("Check if can restore")
+		// 			resp, err := source.RestoreBackupCheck(msg, metadata.DbBackupName, backups[file.Name()].StorageName)
+		// 			if err != nil {
+		// 				s.logger.Info("canrestore request:" + err.Error())
+		// 				continue
+		// 			}
+
+		// 			newBackup := backups[file.Name()]
+		// 			if resp.CanRestore && time.Now().Unix()-newBackup.StartTs > 30 {
+		// 				newBackup.EndTs = int64(1)
+		// 			}
+		// 			backups[file.Name()] = newBackup
+		// 		}
+		// 	}
+		// }
+	}
+	s.restoreRunning = false
 	return backups, nil
 }
 
 func (s *MessagesServer) ReplicasetsRunningDBBackup() map[string]*Client {
 	replicasets := make(map[string]*Client)
 
+	s.clientsLock.Lock()
 	for _, client := range s.clients {
 		if client.isDBBackupRunning() {
 			replicasets[client.ReplicasetName] = client
 		}
 	}
+	s.clientsLock.Unlock()
 	return replicasets
 }
 
@@ -445,8 +506,8 @@ func (s *MessagesServer) ReplicasetsRunningOplogBackup() map[string]*Client {
 }
 
 func (s *MessagesServer) ReplicasetsRunningRestore() map[string]*Client {
-	s.lock.Lock()
-	defer s.lock.Unlock()
+	s.clientsLock.Lock()
+	defer s.clientsLock.Unlock()
 
 	replicasets := make(map[string]*Client)
 
@@ -466,6 +527,7 @@ func (s *MessagesServer) RestoreBackupFromMetadataFile(filename, storageName str
 	filename = filepath.Join(s.workDir, filename)
 	bm, err := LoadMetadataFromFile(filename)
 	if err != nil {
+		log.Errorf("invalid backup metadata file %s: %s", filename, err)
 		return fmt.Errorf("invalid backup metadata file %s: %s", filename, err)
 	}
 
@@ -477,26 +539,32 @@ func (s *MessagesServer) RestoreBackupFromMetadataFile(filename, storageName str
 func (s *MessagesServer) RestoreBackUp(bm *pb.BackupMetadata, storageName string, skipUsersAndRoles bool) error {
 	clients, err := s.RestoreSourcesByReplicaset(bm, storageName)
 	if err != nil {
+		log.Errorf("cannot start backup restore. Cannot find backup source for replicas: %v", err)
 		return errors.Wrapf(err, "cannot start backup restore. Cannot find backup source for replicas")
 	}
 
 	if s.isBackupRunning() {
+		log.Errorf("cannot start a restore while a backup is running")
 		return fmt.Errorf("cannot start a restore while a backup is running")
 	}
 	if s.isRestoreRunning() {
-		return fmt.Errorf("cannot start a restore while another restore is still running")
+		log.Errorf("cannot start a restore while another restore is still running")
+		//return fmt.Errorf("cannot start a restore while another restore is still running")
 	}
 
 	stgs, err := s.listStorages()
 	if err != nil {
+		log.Errorf("cannot get the storages list: %s", err)
 		return fmt.Errorf("cannot get the storages list: %s", err)
 	}
 
 	stg, ok := stgs[storageName]
 	if !ok {
+		log.Errorf("invalid storage %q", storageName)
 		return fmt.Errorf("invalid storage %q", storageName)
 	}
 	if !stg.StorageInfo.Valid {
+		log.Errorf("storage %q is invalid", storageName)
 		return fmt.Errorf("storage %q is invalid", storageName)
 	}
 	s.reset()
@@ -505,12 +573,14 @@ func (s *MessagesServer) RestoreBackUp(bm *pb.BackupMetadata, storageName string
 	// Ping will also update the status and if it is primary or secondary
 	for _, source := range clients {
 		if err := source.Client.ping(); err != nil {
+			s.setRestoreRunning(false)
 			return errors.Wrapf(err, "error while sending ping to client %s", source.Client.ID)
 		}
 	}
 
 	mongoDBVersion, err := s.getMongoDBVersion()
 	if err != nil {
+		s.setRestoreRunning(false)
 		return err
 	}
 
@@ -544,6 +614,8 @@ func (s *MessagesServer) RestoreBackUp(bm *pb.BackupMetadata, storageName string
 					MongodbVersion:    mongoDBVersion,
 				}
 				if err := source.Client.restoreBackup(msg); err != nil {
+					s.setRestoreRunning(false)
+					log.Errorf("cannot send restore backup message to client %v", err)
 					return errors.Wrapf(err, "cannot send restore backup message to client %s", source.Client.ID)
 				}
 			}
@@ -585,6 +657,12 @@ func (s *MessagesServer) StartBackup(opts *pb.StartBackup) error {
 
 	s.backupStatus.lastBackupMetadata = NewBackupMetadata(opts)
 
+	if s.IsShardedSystem() {
+		if err := s.getBalancerStatus(); err != nil {
+			return errors.Wrap(err, "cannot save the current balancer status")
+		}
+	}
+
 	cmdLineOpts, err := s.AllServersCmdLineOpts()
 	if err != nil {
 		return errors.Wrap(err, "cannot Get Cmd Line Opts")
@@ -595,7 +673,7 @@ func (s *MessagesServer) StartBackup(opts *pb.StartBackup) error {
 		return errors.Wrapf(err, "cannot refresh clients state for backup")
 	}
 
-	clients, err := s.BackupSourceByReplicaset()
+	s.backupStatus.sources, err = s.BackupSourceByReplicaset()
 	if err != nil {
 		return errors.Wrapf(err, "cannot start backup. Cannot find backup source for replicas")
 	}
@@ -609,11 +687,12 @@ func (s *MessagesServer) StartBackup(opts *pb.StartBackup) error {
 	s.reset()
 	s.setBackupRunning(true)
 	s.setOplogBackupRunning(true)
-	if err := notify.Post(EventBackupStarted, time.Now()); err != nil {
-		s.logger.Errorf("cannot notify start backup event")
+
+	if err := s.triggerEvent(BackupStartedEvent, time.Now()); err != nil {
+		s.logger.Errorf("cannot trigger event %s: %s", eventName(BackupStartedEvent), err)
 	}
 
-	for replName, client := range clients {
+	for replName, client := range s.backupStatus.sources {
 		s.logger.Infof("Starting backup for replicaset %q on client %s %s %s",
 			replName,
 			client.ID,
@@ -642,6 +721,8 @@ func (s *MessagesServer) StartBackup(opts *pb.StartBackup) error {
 			oplogBackupName,
 		)
 		if err != nil {
+			s.setBackupRunning(false)
+			s.setOplogBackupRunning(false)
 			return errors.Wrapf(err, "cannot add replicaset to metadata")
 		}
 
@@ -657,6 +738,8 @@ func (s *MessagesServer) StartBackup(opts *pb.StartBackup) error {
 			MongodbVersion:  mongoDBVersion,
 		}
 		if err := client.startBackup(msg); err != nil {
+			s.setBackupRunning(false)
+			s.setOplogBackupRunning(false)
 			return errors.Wrapf(err, "cannot start backup for client %s", client.ID)
 		}
 	}
@@ -665,8 +748,6 @@ func (s *MessagesServer) StartBackup(opts *pb.StartBackup) error {
 }
 
 func (s *MessagesServer) getMongoDBVersion() (string, error) {
-	s.lock.Lock()
-	defer s.lock.Unlock()
 	for _, client := range s.clients {
 		if client.NodeType != pb.NodeType_NODE_TYPE_MONGOS {
 			return client.GetMongoDBVersion()
@@ -675,20 +756,55 @@ func (s *MessagesServer) getMongoDBVersion() (string, error) {
 	return "", fmt.Errorf("cannot get MongoDB version. There are no agents connected to a mongod instance")
 }
 
+func (s *MessagesServer) getBalancerStatus() error {
+	c := s.getClientByType(pb.NodeType_NODE_TYPE_MONGOD_CONFIGSVR)
+	bs, err := c.getBalancerStatus()
+
+	// Update the status even if there is a nil in the response.
+	// If for some reason the mongoS instace has gone, we should clear s.backupStatus.balancerStatus so
+	// the balancer is not re-enabled based on an old value
+	s.backupStatusLock.Lock()
+	s.backupStatus.balancerStatus = bs
+	s.backupStatusLock.Unlock()
+
+	if err != nil {
+		return errors.Wrap(err, "cannot get balancer status. internal status was resetted")
+	}
+	return nil
+}
+
 // StartBalancer restarts the balancer if this is a sharded system
 func (s *MessagesServer) StartBalancer() error {
-	s.lock.Lock()
-	defer s.lock.Unlock()
+	var c *Client
+	s.clientsLock.Lock()
 	for _, client := range s.clients {
+		s.logger.Info("client node: " + client.NodeName)
 		if client.NodeType == pb.NodeType_NODE_TYPE_MONGOD_CONFIGSVR {
-			if err := client.startBalancer(); err != nil {
-				return errors.Wrapf(err, "cannot start the balancer via client %q", client.ID)
-			}
-			s.logger.Debug("Balancer started")
+			c = client
 			break
 		}
 	}
-	// This is not a sharded system. There is nothing to do.
+	s.clientsLock.Unlock()
+
+	if c == nil {
+		return nil // This is not a sharded system. There is nothing to do.
+	}
+
+	s.logger.Info("Start client balancer")
+	if err := s.triggerEvent(BeforeBalancerStartEvent, time.Now()); err != nil {
+		s.logger.Errorf("cannot triggerBeforeBalancerStartEvent: %s", err)
+	}
+
+	if err := c.startBalancer(); err != nil {
+		s.logger.Errorf("cannot start the balancer via client %q: %s", c.ID, err)
+		return errors.Wrapf(err, "cannot start the balancer via client %q", c.ID)
+	}
+
+	s.logger.Debug("Balancer started")
+	if err := s.triggerEvent(AfterBalancerStartEvent, time.Now()); err != nil {
+		s.logger.Errorf("cannot trigger AfterBalancerStartEvent: %s", err)
+	}
+
 	return nil
 }
 
@@ -698,19 +814,35 @@ func (s *MessagesServer) Stop() {
 
 // StopBalancer stops the balancer if this is a sharded system
 func (s *MessagesServer) StopBalancer() error {
-	s.lock.Lock()
-	defer s.lock.Unlock()
+	var c *Client
+
+	s.clientsLock.Lock()
 	for _, client := range s.clients {
 		if client.NodeType == pb.NodeType_NODE_TYPE_MONGOD_CONFIGSVR {
-			s.logger.Debug("Stopping the balancer")
-			if err := client.stopBalancer(); err != nil {
-				return errors.Wrapf(err, "cannot stop the balancer via the %q client", client.ID)
-			}
-			s.logger.Debug("Balancer stopped")
+			c = client
 			break
 		}
 	}
-	// This is not a sharded system. There is nothing to do.
+	s.clientsLock.Unlock()
+
+	if c == nil {
+		return nil // This is not a sharded system. There is nothing to do.
+	}
+
+	s.logger.Debug("Stopping the balancer")
+	if err := s.triggerEvent(BeforeBalancerStopEvent, time.Now()); err != nil {
+		s.logger.Errorf("cannot trigger BeforeBalancerStopEvent: %s", err)
+	}
+
+	if err := c.stopBalancer(); err != nil {
+		return errors.Wrapf(err, "cannot stop the balancer via the %q client", c.ID)
+	}
+
+	s.logger.Debug("Balancer stopped")
+	if err := s.triggerEvent(AfterBalancerStopEvent, time.Now()); err != nil {
+		s.logger.Errorf("cannot trigger AfterBalancerStopEvent: %s", err)
+	}
+
 	return nil
 }
 
@@ -722,16 +854,17 @@ func (s *MessagesServer) StopOplogTail() error {
 		return fmt.Errorf("backup is not running")
 	}
 	// This should never happen. We get the last oplog timestamp when agents call DBBackupFinished
-	if s.backupStatus.lastOplogTs == 0 {
-		s.backupStatus.lastOplogTs = time.Now().Unix()
+	if s.backupStatus.lastBackupMetadata.LastOplogTs() == 0 {
+		s.backupStatus.lastBackupMetadata.SetLastOplogTs(time.Now().Unix())
 		s.logger.Errorf("Trying to stop the oplog tailer but last oplog timestamp is 0. Using current timestamp")
 	}
 	s.logger.Infof("StopOplogTs: %d (%v)",
-		s.backupStatus.lastOplogTs,
-		time.Unix(s.backupStatus.lastOplogTs, 0).Format(time.RFC3339),
+		s.backupStatus.lastBackupMetadata.LastOplogTs(),
+		time.Unix(s.backupStatus.lastBackupMetadata.LastOplogTs(), 0).Format(time.RFC3339),
 	)
 
 	var gErr error
+	s.clientsLock.Lock()
 	for _, client := range s.clients {
 		s.logger.Debugf("Checking if client %s is running the oplog backup: %v",
 			client.NodeName,
@@ -740,14 +873,15 @@ func (s *MessagesServer) StopOplogTail() error {
 		if client.isOplogTailerRunning() {
 			s.logger.Debugf("Stopping oplog tail in client %s at %s",
 				client.NodeName,
-				time.Unix(s.backupStatus.lastOplogTs, 0).Format(time.RFC3339),
+				time.Unix(s.backupStatus.lastBackupMetadata.LastOplogTs(), 0).Format(time.RFC3339),
 			)
-			err := client.stopOplogTail(s.backupStatus.lastOplogTs)
+			err := client.stopOplogTail(s.backupStatus.lastBackupMetadata.LastOplogTs())
 			if err != nil {
 				gErr = errors.Wrapf(gErr, "client: %s, error: %s", client.NodeName, err)
 			}
 		}
 	}
+	s.clientsLock.Unlock()
 	s.setBackupRunning(false)
 
 	if gErr != nil {
@@ -773,7 +907,9 @@ func (s *MessagesServer) WaitBackupFinish() error {
 	if len(replicasets) == 0 {
 		return nil
 	}
-	<-s.dbBackupFinishChan
+	if _, err := s.WaitForEvent(BackupFinishedEvent, WaitForever); err != nil {
+		s.AddError(errors.Wrap(err, "cannot wait for backup to finish"))
+	}
 	return s.lastBackupErrors()
 }
 
@@ -803,8 +939,6 @@ func (s *MessagesServer) WriteServerBackupMetadata(filename string) error {
 // WriteBackupMetadata writes the metadata along with the backed up files in the destination storage
 func (s *MessagesServer) WriteBackupMetadata() error {
 	var c *Client
-	s.lock.Lock()
-	defer s.lock.Unlock()
 
 	buf, err := s.backupStatus.lastBackupMetadata.JSON()
 	if err != nil {
@@ -812,16 +946,35 @@ func (s *MessagesServer) WriteBackupMetadata() error {
 	}
 	// Take the first client from the connected clients list.
 	// All clients should have access to all storages so any client will be able to write the metadata
+	s.clientsLock.Lock()
 	for _, client := range s.clients {
-		c = client
-		break
+		if client.NodeType == pb.NodeType_NODE_TYPE_MONGOD_CONFIGSVR {
+			c = client
+			break
+		}
+	}
+	s.clientsLock.Unlock()
+
+	// Try to write the metadata to theconfig server
+	if c != nil {
+		return c.writeBackupMetadata(
+			s.backupStatus.lastBackupMetadata.NamePrefix()+".json",
+			s.backupStatus.lastBackupMetadata.metadata.StorageName,
+			buf,
+		)
 	}
 
-	return c.writeBackupMetadata(
-		s.backupStatus.lastBackupMetadata.NamePrefix()+".json",
-		s.backupStatus.lastBackupMetadata.metadata.StorageName,
-		buf,
-	)
+	// if there are no config servers, try to write the metadata using one of the agents that ran
+	// the last backup
+	for _, c := range s.backupStatus.sources {
+		return c.writeBackupMetadata(
+			s.backupStatus.lastBackupMetadata.NamePrefix()+".json",
+			s.backupStatus.lastBackupMetadata.metadata.StorageName,
+			buf,
+		)
+	}
+
+	return nil
 }
 
 // WorkDir returns the server working directory.
@@ -840,21 +993,12 @@ func (s *MessagesServer) WorkDir() string {
 // so, the client shouldn't receive an error.
 func (s *MessagesServer) DBBackupFinished(ctx context.Context, msg *pb.DBBackupFinishStatus) (
 	*pb.DBBackupFinishedAck, error) {
-	s.lock.Lock()
-	defer s.lock.Unlock()
 
 	client := s.getClientByID(msg.GetClientId())
 	if client == nil {
 		return nil, fmt.Errorf("unknown client ID: %s", msg.GetClientId())
 	}
 	client.setDBBackupRunning(false)
-	replicasets := s.ReplicasetsRunningDBBackup()
-
-	if len(replicasets) == 0 {
-		if err := notify.Post(EventBackupFinish, time.Now()); err != nil {
-			s.AddError(errors.Wrap(err, "cannot notify EventBackupFinish (DBBackupFinished)"))
-		}
-	}
 
 	if !msg.GetOk() {
 		if strings.TrimSpace(msg.GetError()) != "" {
@@ -875,9 +1019,17 @@ func (s *MessagesServer) DBBackupFinished(ctx context.Context, msg *pb.DBBackupF
 	// Keep the last (bigger) oplog timestamp from all clients running the backup.
 	// When all clients finish the backup, we will call CloseAt(s.lastOplogTs) on all clients to have a consistent
 	// stop time for all oplogs.
-	if lastOplogTs > s.backupStatus.lastOplogTs {
-		s.backupStatus.lastOplogTs = lastOplogTs
+	if lastOplogTs > s.backupStatus.lastBackupMetadata.LastOplogTs() {
+		s.backupStatus.lastBackupMetadata.SetLastOplogTs(lastOplogTs)
 	}
+
+	replicasets := s.ReplicasetsRunningDBBackup()
+	if len(replicasets) == 0 {
+		if err := s.triggerEvent(BackupFinishedEvent, time.Now()); err != nil {
+			s.AddError(errors.Wrap(err, "cannot trigger BackupFinished event"))
+		}
+	}
+
 	return &pb.DBBackupFinishedAck{}, nil
 }
 
@@ -954,13 +1106,40 @@ func (s *MessagesServer) MessagesChat(stream pb.Messages_MessagesChatServer) err
 	return nil
 }
 
+func (s *MessagesServer) streamIOChans(stream pb.Messages_MessagesChatServer) (
+	chan *pb.ClientMessage, chan *pb.ServerMessage) {
+	in := make(chan *pb.ClientMessage, 100)
+	out := make(chan *pb.ServerMessage, 100)
+
+	go func() {
+		for {
+			msg, err := stream.Recv()
+			if err != nil {
+				// s.logger.Errorf("Error receiving data from the gRPC stream: %v", err)
+				return
+			}
+			in <- msg
+		}
+	}()
+
+	go func() {
+		for {
+			msg := <-out
+			if err := stream.Send(msg); err != nil {
+				//s.logger.Errorf("Cannot send message (type %T) throgh the gRPC stream: %s", msg.Payload, err)
+				return
+			}
+		}
+	}()
+
+	return in, out
+}
+
 // OplogBackupFinished process oplog tailer finished message from clients.
 // After the the oplog tailer has been closed on clients, clients should call this method to inform
 // the event to the server
 func (s *MessagesServer) OplogBackupFinished(ctx context.Context, msg *pb.OplogBackupFinishStatus) (
 	*pb.OplogBackupFinishedAck, error) {
-	s.lock.Lock()
-	defer s.lock.Unlock()
 	client := s.getClientByID(msg.GetClientId())
 	if client == nil {
 		return nil, fmt.Errorf("unknown client ID: %s", msg.GetClientId())
@@ -985,6 +1164,7 @@ func (s *MessagesServer) RestoreCompleted(ctx context.Context, msg *pb.RestoreCo
 
 	client := s.getClientByID(msg.GetClientId())
 	if client == nil {
+		s.setRestoreRunning(false)
 		err := fmt.Errorf("unknown client ID: %s", msg.GetClientId())
 		s.logger.Error(err)
 		return nil, err
@@ -1032,6 +1212,9 @@ func (s *MessagesServer) RestoreCompleted(ctx context.Context, msg *pb.RestoreCo
 // }
 
 func (s *MessagesServer) getClientByID(id string) *Client {
+	s.clientsLock.Lock()
+	defer s.clientsLock.Unlock()
+
 	for _, client := range s.clients {
 		if client.ID == id {
 			return client
@@ -1062,9 +1245,6 @@ func (s *MessagesServer) getClientByNodeName(name string) *Client {
 // This info will be saved with the backup metadata as extra information that might be
 // needed to rebuild the servers
 func (s *MessagesServer) AllServersCmdLineOpts() ([]*pb.Server, error) {
-	s.lock.Lock()
-	defer s.lock.Unlock()
-
 	serverOpts := make([]*pb.Server, 0)
 	serverOptsChan := make(chan *pb.Server)
 
@@ -1080,6 +1260,8 @@ func (s *MessagesServer) AllServersCmdLineOpts() ([]*pb.Server, error) {
 	}()
 
 	wgb := &sync.WaitGroup{}
+	s.clientsLock.Lock()
+
 	for _, client := range s.clients {
 		wgb.Add(1)
 		c := client
@@ -1094,6 +1276,7 @@ func (s *MessagesServer) AllServersCmdLineOpts() ([]*pb.Server, error) {
 			serverOptsChan <- &pb.Server{Id: c.ID, CmdLineOpts: string(msg.GetOptions())}
 		}()
 	}
+	s.clientsLock.Unlock()
 	wgb.Wait()
 	close(serverOptsChan)
 	wga.Wait()
@@ -1114,8 +1297,7 @@ func (s *MessagesServer) ValidateReplicasetAgents() error {
 	var err error
 	var repls []string
 
-	s.lock.Lock()
-	defer s.lock.Unlock()
+	s.clientsLock.Lock()
 
 	for _, client := range s.clients {
 		if client.NodeType == pb.NodeType_NODE_TYPE_MONGOD_CONFIGSVR {
@@ -1126,6 +1308,7 @@ func (s *MessagesServer) ValidateReplicasetAgents() error {
 			break
 		}
 	}
+	s.clientsLock.Unlock()
 
 	for _, repl := range repls {
 		haveRepl := false
@@ -1168,44 +1351,47 @@ func getFileExtension(compressionType pb.CompressionType, cypher pb.Cypher) stri
 }
 
 func (s *MessagesServer) isBackupRunning() bool {
-	s.lock.Lock()
-	defer s.lock.Unlock()
+	s.clientsLock.Lock()
+	defer s.clientsLock.Unlock()
 	return s.backupStatus.backupRunning
 }
 
 func (s *MessagesServer) isOplogBackupRunning() bool {
-	s.lock.Lock()
-	defer s.lock.Unlock()
+	s.clientsLock.Lock()
+	defer s.clientsLock.Unlock()
 	return s.backupStatus.oplogBackupRunning
 }
 
 func (s *MessagesServer) isRestoreRunning() bool {
-	s.lock.Lock()
-	defer s.lock.Unlock()
+	s.clientsLock.Lock()
+	defer s.clientsLock.Unlock()
 	return s.restoreRunning
 }
 
 func (s *MessagesServer) registerClient(stream pb.Messages_MessagesChatServer, msg *pb.ClientMessage) error {
-	s.lock.Lock()
-	defer s.lock.Unlock()
+
 	if msg.ClientId == "" {
 		return fmt.Errorf("invalid client ID (empty)")
 	}
 
+	s.clientsLock.Lock()
 	if client, exists := s.clients[msg.ClientId]; exists {
 		if err := client.ping(); err != nil {
 			delete(s.clients, msg.ClientId)
 		} else {
+			s.clientsLock.Unlock()
 			return fmt.Errorf("client already exists")
 		}
 	}
+	s.clientsLock.Unlock()
 
 	regMsg := msg.GetRegisterMsg()
 	if regMsg == nil || regMsg.NodeType == pb.NodeType_NODE_TYPE_INVALID {
 		return fmt.Errorf("node type in register payload cannot be empty")
 	}
-	s.logger.Debugf("Register msg: %+v", regMsg)
-	client := newClient(msg.ClientId, regMsg, stream, s.logger)
+
+	in, out := s.streamIOChans(stream)
+	client := newClient(msg.ClientId, regMsg, in, out, s.logger)
 	s.clients[msg.ClientId] = client
 
 	return nil
@@ -1214,7 +1400,7 @@ func (s *MessagesServer) registerClient(stream pb.Messages_MessagesChatServer, m
 func (s *MessagesServer) reset() {
 	s.backupStatusLock.Lock()
 	defer s.backupStatusLock.Unlock()
-	s.backupStatus.lastOplogTs = 0
+	s.backupStatus.lastBackupMetadata.SetLastOplogTs(0)
 	s.backupStatus.backupRunning = false
 	s.backupStatus.oplogBackupRunning = false
 	s.restoreRunning = false
@@ -1222,27 +1408,27 @@ func (s *MessagesServer) reset() {
 }
 
 func (s *MessagesServer) setBackupRunning(status bool) {
-	s.lock.Lock()
-	defer s.lock.Unlock()
+	s.clientsLock.Lock()
+	defer s.clientsLock.Unlock()
 	s.backupStatus.backupRunning = status
 }
 
 func (s *MessagesServer) setOplogBackupRunning(status bool) {
-	s.lock.Lock()
-	defer s.lock.Unlock()
+	s.clientsLock.Lock()
+	defer s.clientsLock.Unlock()
 	s.backupStatus.oplogBackupRunning = status
 }
 
 func (s *MessagesServer) setRestoreRunning(status bool) {
-	s.lock.Lock()
-	defer s.lock.Unlock()
+	s.clientsLock.Lock()
+	defer s.clientsLock.Unlock()
 	s.restoreRunning = status
 }
 
 func (s *MessagesServer) unregisterClient(id string) error {
 	s.logger.Infof("Unregistering client %s", id)
-	s.lock.Lock()
-	defer s.lock.Unlock()
+	s.clientsLock.Lock()
+	defer s.clientsLock.Unlock()
 
 	if _, exists := s.clients[id]; !exists {
 		return fmt.Errorf("unknown client")
@@ -1250,4 +1436,95 @@ func (s *MessagesServer) unregisterClient(id string) error {
 
 	delete(s.clients, id)
 	return nil
+}
+
+func (s *MessagesServer) triggerEvent(event int, value interface{}) error {
+	s.logger.Debugf("triggering event %s after %v", eventName(event), 1)
+	if !isValidEvent(event) {
+		return fmt.Errorf("event %d is invalid", event)
+	}
+	c := s.eventsNotifier.Emit(eventName(event), value)
+	select {
+	case <-c:
+		s.logger.Debugf("triggered event %s after %v", eventName(event), 1)
+	case <-time.After(1 * time.Second):
+		s.logger.Debugf("timeout triggering event %s after %v", eventName(event), 1)
+		close(c)
+	}
+	return nil
+}
+
+// WaitForEvent will wait until the desired event gets fired.
+// timeout = -1 means wait forever
+func (s *MessagesServer) WaitForEvent(event int, timeout time.Duration) (interface{}, error) {
+	var re interface{}
+	var err error
+	if !isValidEvent(event) {
+		return nil, fmt.Errorf("unknown event %q", eventName(event))
+	}
+
+	var t *time.Timer
+	if int64(timeout) >= 0 {
+		t = time.NewTimer(timeout)
+	} else {
+		t = time.NewTimer(0)
+		t.Stop()
+	}
+	c := s.eventsNotifier.Once(eventName(event), func(ev *emitter.Event) {
+		re = ev
+	})
+	select {
+	case <-c:
+		t.Stop()
+	case <-t.C:
+		err = fmt.Errorf("timeout (%v) for event %q", timeout, eventName(event))
+	}
+
+	return re, err
+}
+
+func (s *MessagesServer) BalancerStatus() *pb.BalancerStatus {
+	s.backupStatusLock.Lock()
+	defer s.backupStatusLock.Unlock()
+	return s.backupStatus.balancerStatus
+}
+
+func isValidEvent(e int) bool {
+	validEvents := []int{BackupFinishedEvent, BackupStartedEvent, BeforeBalancerStartEvent,
+		AfterBalancerStartEvent, BeforeBalancerStopEvent, AfterBalancerStopEvent}
+
+	for _, event := range validEvents {
+		if event == e {
+			return true
+		}
+	}
+	return false
+}
+
+func eventName(event int) string {
+	names := []string{
+		"BackupFinishedEvent",
+		"BackupStartedEvent",
+		"BeforeBalancerStartEvent",
+		"AfterBalancerStartEvent",
+		"BeforeBalancerStopEvent",
+		"AfterBalancerStopEvent",
+	}
+	if event < 0 || event >= len(names) {
+		return fmt.Sprintf("invalid event %d", event)
+	}
+	return names[event]
+}
+
+func (s *MessagesServer) getClientByType(pb.NodeType) *Client {
+	var c *Client
+	s.clientsLock.Lock()
+	for _, client := range s.clients {
+		if client.NodeType == pb.NodeType_NODE_TYPE_MONGOD_CONFIGSVR {
+			c = client
+			break
+		}
+	}
+	s.clientsLock.Unlock()
+	return c
 }

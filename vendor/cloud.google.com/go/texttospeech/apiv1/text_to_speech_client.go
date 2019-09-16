@@ -18,6 +18,7 @@ package texttospeech
 
 import (
 	"context"
+	"math"
 	"time"
 
 	gax "github.com/googleapis/gax-go/v2"
@@ -39,6 +40,8 @@ func defaultClientOptions() []option.ClientOption {
 	return []option.ClientOption{
 		option.WithEndpoint("texttospeech.googleapis.com:443"),
 		option.WithScopes(DefaultAuthScopes()...),
+		option.WithGRPCDialOption(grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(math.MaxInt32))),
 	}
 }
 
@@ -59,7 +62,7 @@ func defaultCallOptions() *CallOptions {
 	}
 	return &CallOptions{
 		ListVoices:       retry[[2]string{"default", "idempotent"}],
-		SynthesizeSpeech: retry[[2]string{"default", "idempotent"}],
+		SynthesizeSpeech: retry[[2]string{"default", "non_idempotent"}],
 	}
 }
 
