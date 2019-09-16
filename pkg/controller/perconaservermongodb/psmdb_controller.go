@@ -130,6 +130,16 @@ func (r *ReconcilePerconaServerMongoDB) Reconcile(request reconcile.Request) (re
 		return rr, err
 	}
 
+	if request.Namespace == "" {
+		request = reconcile.Request{
+			types.NamespacedName{
+				Namespace: cr.Spec.Namespace,
+				Name:      request.Name,
+			},
+		}
+		cr.Namespace = cr.Spec.Namespace
+	}
+
 	defer func() {
 		r.updateStatus(cr, err)
 	}()
@@ -389,7 +399,6 @@ func (r *ReconcilePerconaServerMongoDB) reconcileStatefulSet(arbiter bool, cr *a
 	if replset.VolumeSpec.MongodDataVolClaimName != "" {
 		mongodDataVolClaimName = replset.VolumeSpec.MongodDataVolClaimName
 	}
-
 
 	// add TLS/SSL Volume
 	t := true

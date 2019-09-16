@@ -45,6 +45,7 @@ type PerconaServerMongoDBSpec struct {
 	Pause            bool                                 `json:"pause,omitempty"`
 	Platform         *version.Platform                    `json:"platform,omitempty"`
 	Image            string                               `json:"image,omitempty"`
+	Namespace        string                               `json:"namespace,omitempty"`
 	ImagePullSecrets []corev1.LocalObjectReference        `json:"imagePullSecrets,omitempty"`
 	RunUID           int64                                `json:"runUid,omitempty"`
 	UnsafeConf       bool                                 `json:"allowUnsafeConfigurations"`

@@ -13,6 +13,7 @@ import (
 )
 
 func (r *ReconcilePerconaServerMongoDB) reconcileUsersSecret(cr *api.PerconaServerMongoDB) error {
+	fmt.Println("mynamesapce: ", cr.Namespace)
 	secretObj := corev1.Secret{}
 	err := r.client.Get(context.TODO(),
 		types.NamespacedName{

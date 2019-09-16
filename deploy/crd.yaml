@@ -11,7 +11,7 @@ spec:
     singular: perconaservermongodb
     shortNames:
     - psmdb
-  scope: Namespaced
+  scope: Cluster
   versions:
     - name: v1
       storage: true
@@ -42,7 +42,7 @@ spec:
     singular: perconaservermongodbbackup
     shortNames:
     - psmdb-backup
-  scope: Namespaced
+  scope: Cluster
   versions:
     - name: v1
       storage: true
@@ -87,7 +87,7 @@ spec:
     singular: perconaservermongodbrestore
     shortNames:
     - psmdb-restore
-  scope: Namespaced
+  scope: Cluster
   versions:
     - name: v1
       storage: true
